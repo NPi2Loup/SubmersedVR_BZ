@@ -14,12 +14,261 @@ namespace SubmersedVR
     // Tweaks regarding the HUD of the game
     static class VRHud
     {
-        private static Transform screenCanvas;
+        internal static Transform screenCanvas;
         private static Transform overlayCanvas;
         private static Transform hud;
 
         private static Canvas staticHudCanvas = null;
+        private const float StaticHudBaseScale = 0.00085f;
+        // Floor for the HUD canvas scale: file/static values below 0.25 are
+        // clamped here so the HUD can never be scaled under the slider minimum.
+        private const float MinHudScale = 0.25f;
+        private static string lastHudScaleLog = null;
+        private static string lastStaticHudLog = null;
+        private static string lastHudStateLog = null;
+        private static bool uiScaleListenerRegistered = false;
+        private static bool menuIdentityLogged = false;
+        private static bool overlayScalerLogged = false;
+
+        // One-shot diagnostic for the "boot different from game" complaint:
+        // the main menu UI hangs either off the screenCanvas (which we scale)
+        // or its own canvas (uGUI_MainMenu.canvasScaler, which we never touch).
+        // If the menu is on its own canvas, the menu can't follow the canvas
+        // scale sliders - the perceived size gap between boot and game is then
+        // a canvas-identity problem, not a scale problem.
+        private static void LogMenuCanvasIdentity()
+        {
+            if (menuIdentityLogged)
+            {
+                return;
+            }
+            var menu = uGUI_MainMenu.main;
+            if ((UnityEngine.Object)(object)menu == null || (UnityEngine.Object)(object)screenCanvas == null)
+            {
+                return;
+            }
+            menuIdentityLogged = true;
+            bool onScreen = menu.transform.IsChildOf(screenCanvas);
+            string scalerInfo = menu.canvasScaler != null
+                ? $"{menu.canvasScaler.name} ref={menu.canvasScaler.referenceResolution.x:0}x{menu.canvasScaler.referenceResolution.y:0} dist={menu.canvasScaler.distance:0.##}"
+                : "null";
+            Mod.logger.LogInfo($"Menu canvas identity: onScreenCanvas={onScreen} menuScaler={scalerInfo}");
+        }
         // private static OffsetCalibrationTool calibrationTool;
+
+        internal static float HudCanvasScaleX => Mathf.Max(MinHudScale, Settings.HudCanvasScaleX);
+        internal static float HudCanvasScaleY => Mathf.Max(MinHudScale, Settings.HudCanvasScaleY);
+
+        public static void ApplyHudScale()
+        {
+            if ((UnityEngine.Object)(object)screenCanvas != null)
+            {
+                var scaler = screenCanvas.GetComponent<uGUI_CanvasScaler>();
+                if (scaler != null)
+                {
+                    scaler.SetDirty();
+                }
+            }
+            ApplyStaticHudScale();
+            // The loading screen is a child of this canvas: re-apply its
+            // compensation so it does not inherit the canvas factor change.
+            LoadingScreen_Patch.ApplyScale();
+        }
+
+        // uGUI.Update copies MiscSettings.GetUIScale() into uGUI_CanvasScaler.uiScale
+        // every frame. Re-dirtying the screen canvas scaler makes the update fixer
+        // re-apply the static HUD scale and size with the new UI Scale value.
+        private static void OnUiScaleChanged(float scale)
+        {
+            if ((UnityEngine.Object)(object)screenCanvas == null)
+            {
+                return;
+            }
+            screenCanvas.GetComponent<uGUI_CanvasScaler>()?.SetDirty();
+        }
+
+        // The canvas reference size is recomputed from public data only. The game's
+        // uGUI_CanvasScaler.UpdateFrustum (decompiled) computes it as:
+        //   baseScale = min(screenW / refW, screenH / refH)
+        //   if (scaleMode > DontScale) baseScale *= uiScale
+        //   size      = (screenW / baseScale, screenH / baseScale)
+        // with screen = GraphicsUtil.GetScreenSize() and ref = the scaler's public
+        // referenceResolution. Reading the scaler's private _width/_height fields
+        // through the publicized reference is risky on Mono, so we recompute instead.
+        private static void GetCanvasReferenceSize(uGUI_CanvasScaler scaler, out float width, out float height)
+        {
+            width = -1f;
+            height = -1f;
+            if ((UnityEngine.Object)(object)scaler == null)
+            {
+                return;
+            }
+            Vector2Int screen = GraphicsUtil.GetScreenSize();
+            if (screen.x <= 0 || screen.y <= 0 ||
+                scaler.referenceResolution.x <= 0f || scaler.referenceResolution.y <= 0f)
+            {
+                return;
+            }
+            float baseScale = Mathf.Min((float)screen.x / scaler.referenceResolution.x, (float)screen.y / scaler.referenceResolution.y);
+            if (scaler.scaleMode > uGUI_CanvasScaler.ScaleMode.DontScale)
+            {
+                baseScale *= uGUI_CanvasScaler.uiScale;
+            }
+            width = (float)screen.x / baseScale;
+            height = (float)screen.y / baseScale;
+        }
+
+        internal static void ApplyScreenCanvasScale(uGUI_CanvasScaler scaler)
+        {
+            if ((UnityEngine.Object)(object)scaler == null)
+            {
+                return;
+            }
+            GetCanvasReferenceSize(scaler, out float width, out float height);
+            if (width <= 0f || height <= 0f)
+            {
+                return;
+            }
+            var rt = scaler.transform as RectTransform;
+            if (rt == null)
+            {
+                return;
+            }
+            // The game's UpdateFrustum sets localScale from MainCamera's
+            // frustum, but only on a cache miss (_scaleX != num11). After a
+            // world reload with identical inputs (same FOV/distance/screen/
+            // uiScale as the menu) the cached write is skipped and whatever
+            // transform survived is used: a stale localScale rendered the HUD
+            // at the wrong size until a transient uiScale change (dragging
+            // the UI Scale slider) forced a cache miss. Write the same value
+            // the game would have written (its exact formula: frustum size at
+            // `distance` per screen pixel x baseScale) so every run leaves a
+            // deterministic transform, then shrink only the rect.
+            Camera cam = MainCamera.camera;
+            if ((UnityEngine.Object)(object)cam != null)
+            {
+                Vector2Int s = GraphicsUtil.GetScreenSize();
+                if (s.x > 0 && s.y > 0)
+                {
+                    float halfH = scaler.distance * Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
+                    float baseS = Mathf.Min((float)s.x / scaler.referenceResolution.x, (float)s.y / scaler.referenceResolution.y);
+                    if (scaler.scaleMode > uGUI_CanvasScaler.ScaleMode.DontScale)
+                    {
+                        baseS *= uGUI_CanvasScaler.uiScale;
+                    }
+                    // num5 == num6 algebraically (frustum width / screenW ==
+                    // frustum height / screenH): one uniform factor.
+                    float ls = 2f * halfH / (float)s.y * baseS;
+                    rt.localScale = new Vector3(ls, ls, ls);
+                }
+            }
+            // The shrunken rect keeps the HUD footprint at the user configured
+            // fraction of the view frustum while the content follows the
+            // vanilla UI Scale.
+            rt.SetSizeWithCurrentAnchors(RectTransform.Axis.Horizontal, width * HudCanvasScaleX);
+            rt.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, height * HudCanvasScaleY);
+            ApplyHudOffset(rt);
+            ApplyStaticHudScale();
+            // Re-logged whenever the effective values change (slider moves,
+            // canvas factor change, uiScale migration) so A/B tests show up
+            // in the log. phys = physical world size of the canvas (rect x
+            // accumulated scale): the number that actually determines how big
+            // the HUD looks - it must match between world entry and after the
+            // (no longer needed) UI Scale drag.
+            Camera uiCam = (VRCameraRig.instance != null) ? VRCameraRig.instance.uiCamera : null;
+            float physW = rt.rect.width * rt.lossyScale.x;
+            float physH = rt.rect.height * rt.lossyScale.y;
+            Vector2Int screenSize = GraphicsUtil.GetScreenSize();
+            string ctx = uGUI.isMainLevel ? "game" : "menu";
+            if (ctx == "menu")
+            {
+                LogMenuCanvasIdentity();
+            }
+            string signature = string.Format("ctx={0} canvasX={1:0.##} canvasY={2:0.##} offsetX={3:0.##} offsetY={4:0.##} uiScale={5:0.##} ref={6:0.#}x{7:0.#} screen={8}x{9} phys={10:0.###}x{11:0.###} ls={12:0.######} camFov={13} uiFov={14} dist={15:0.##}",
+                ctx,
+                HudCanvasScaleX, HudCanvasScaleY, Settings.HudOffsetX, Settings.HudOffsetY, uGUI_CanvasScaler.uiScale, width, height,
+                screenSize.x, screenSize.y, physW, physH,
+                rt.localScale.x,
+                cam != null ? cam.fieldOfView.ToString("0.#") : "?",
+                uiCam != null ? uiCam.fieldOfView.ToString("0.#") : "?",
+                scaler.distance);
+            if (signature != lastHudScaleLog)
+            {
+                lastHudScaleLog = signature;
+                Mod.logger.LogInfo($"HUD scale applied: {signature} vrMode={scaler.vrMode} scaleMode={scaler.scaleMode}");
+            }
+            LogHudWorldState(rt);
+        }
+
+        // Diagnostic for "HUD items disappear when touching the canvas slider":
+        // the scale log above is healthy (phys ~1.2 m), so the invisibility is
+        // not a scale issue. Log the screenCanvas world state AND the SceneHUD
+        // (hud) state together to see if the HUD content is being moved/hidden
+        // when the canvas is re-scaled. The subtitles (TalkingHead) live
+        // separately, so a screenCanvas-level move would hide the SceneHUD but
+        // not the subtitles - matching the reported symptom.
+        private static void LogHudWorldState(RectTransform rt)
+        {
+            string hudState = (UnityEngine.Object)(object)hud != null
+                ? $"active={hud.gameObject.activeInHierarchy} parent={(hud.parent != null ? hud.parent.name : "?")} worldPos=({hud.position.x:0.###},{hud.position.y:0.###},{hud.position.z:0.###}) worldScaleX={hud.lossyScale.x:0.###} localPos=({hud.localPosition.x:0.###},{hud.localPosition.y:0.###},{hud.localPosition.z:0.###})"
+                : "hud=null";
+            string canvasState = $"worldPos=({rt.position.x:0.###},{rt.position.y:0.###},{rt.position.z:0.###}) anchoredPos=({rt.anchoredPosition.x:0.##},{rt.anchoredPosition.y:0.##}) anchorMin=({rt.anchorMin.x:0.##},{rt.anchorMin.y:0.##}) anchorMax=({rt.anchorMax.x:0.##},{rt.anchorMax.y:0.##}) pivot=({rt.pivot.x:0.##},{rt.pivot.y:0.##})";
+            string sig = hudState + " || canvas: " + canvasState;
+            if (sig != lastHudStateLog)
+            {
+                lastHudStateLog = sig;
+                Mod.logger.LogInfo($"HUD state: {sig}");
+            }
+        }
+
+        private static void ApplyHudOffset(RectTransform rt)
+        {
+            // Offsets are in pixels of the HUD canvas reference resolution
+            rt.anchoredPosition = new Vector2(Settings.HudOffsetX, Settings.HudOffsetY);
+        }
+
+        private static void ApplyStaticHudScale()
+        {
+            if (staticHudCanvas == null || (UnityEngine.Object)(object)screenCanvas == null)
+            {
+                return;
+            }
+            // The static HUD hosts the same content as the screen canvas, so it has
+            // to track the legacy UI Scale to keep matching the screen canvas content.
+            float uiScale = uGUI_CanvasScaler.uiScale;
+            staticHudCanvas.transform.localScale = new Vector3(StaticHudBaseScale * uiScale, StaticHudBaseScale * uiScale, StaticHudBaseScale * uiScale);
+            var scaler = screenCanvas.GetComponent<uGUI_CanvasScaler>();
+            GetCanvasReferenceSize(scaler, out float width, out float height);
+            if (width <= 0f || height <= 0f)
+            {
+                return;
+            }
+            var rt = staticHudCanvas.GetComponent<RectTransform>();
+            rt.SetSizeWithCurrentAnchors(RectTransform.Axis.Horizontal, width * HudCanvasScaleX);
+            rt.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, height * HudCanvasScaleY);
+            ApplyHudOffset(rt);
+            // Diagnostic for the "HUD disappeared" case the screenCanvas log
+            // cannot see: while the player is in a vehicle, OnEnterVehicle
+            // reparents the `hud` content onto THIS canvas, and this canvas is
+            // scaled by a fixed base (StaticHudBaseScale * uiScale), NOT by the
+            // camera frustum like the screen canvas. Its real physical size,
+            // position and whether the HUD content is on it are logged here so
+            // a breakage inside a vehicle is captured.
+            float sPhysW = rt.rect.width * rt.lossyScale.x;
+            float sPhysH = rt.rect.height * rt.lossyScale.y;
+            bool hudOnStatic = (UnityEngine.Object)(object)hud != null && hud.parent == staticHudCanvas.transform;
+            Vector3 sPos = staticHudCanvas.transform.localPosition;
+            string sSig = string.Format("sPhys={0:0.###}x{1:0.###} sLs={2:0.######} uiScale={3:0.##} canvasX={4:0.##} canvasY={5:0.##} offset=({6:0.##},{7:0.##}) localPos=({8:0.##},{9:0.##},{10:0.##}) hudOnStatic={11} worldCam={12}",
+                sPhysW, sPhysH, rt.lossyScale.x, uiScale, HudCanvasScaleX, HudCanvasScaleY,
+                Settings.HudOffsetX, Settings.HudOffsetY, sPos.x, sPos.y, sPos.z,
+                hudOnStatic,
+                (UnityEngine.Object)(object)staticHudCanvas.worldCamera == null ? "null" : staticHudCanvas.worldCamera.name);
+            if (sSig != lastStaticHudLog)
+            {
+                lastStaticHudLog = sSig;
+                Mod.logger.LogInfo($"StaticHUD: {sSig}");
+            }
+        }
 
         public static void HideOverlays()
         {
@@ -70,17 +319,27 @@ namespace SubmersedVR
 
         public static void SetupHandReticleLaserPointer(Camera uiCamera, Transform rightControllerUI)
         {
-            var handReticle = HandReticle.main.gameObject.WithParent(VRCameraRig.instance.laserPointerUI.pointerDot.transform);
+            // Unity fake-null: a destroyed rig / laserPointer / pointerDot passes
+            // C#'s reference checks and would throw on the chained member access.
+            var rig = VRCameraRig.instance;
+            if ((UnityEngine.Object)(object)rig == null ||
+                (UnityEngine.Object)(object)rig.laserPointerUI == null ||
+                (UnityEngine.Object)(object)rig.laserPointerUI.pointerDot == null)
+            {
+                return;
+            }
+            var dot = rig.laserPointerUI.pointerDot;
+            var handReticle = HandReticle.main.gameObject.WithParent(dot.transform);
             handReticle.transform.LookAt(uiCamera.transform.position);
             handReticle.transform.localRotation = Quaternion.Euler(40, 0, 0);
-            handReticle.transform.localPosition = new Vector3(0, -5, VRCameraRig.instance.laserPointerUI.pointerDot.transform.localPosition.z);//new Vector3(0, 0, 0.05f);
-            handReticle.transform.localScale = VRCameraRig.instance.laserPointerUI.pointerDot.transform.localScale * 2;//new Vector3(0.001f, 0.001f, 0.001f);
+            handReticle.transform.localPosition = new Vector3(0, -5, dot.transform.localPosition.z);//new Vector3(0, 0, 0.05f);
+            handReticle.transform.localScale = dot.transform.localScale * 2;//new Vector3(0.001f, 0.001f, 0.001f);
         }
 
         public static void OnHandReticleSettingChanged(bool onLaserPointer)
         {
             var rig = VRCameraRig.instance;
-            if (!rig)
+            if (!rig || rig.rightControllerUI == null)
             {
                 return;
             }
@@ -99,7 +358,20 @@ namespace SubmersedVR
         {
             Mod.logger.LogDebug($"Setting up HUD for {uiCamera.name}");
 
+            Transform prevScreen = screenCanvas;
             screenCanvas = uGUI.main.screenCanvas.gameObject.transform;
+            // One identity line per Setup: reveals whether a world (re)load
+            // created a new screenCanvas and how it relates to the previous
+            // one (stale reference = the old canvas would keep the scale
+            // while the new one renders at 100 % until this runs).
+            if ((UnityEngine.Object)(object)prevScreen == null)
+            {
+                Mod.logger.LogInfo($"screenCanvas identity: {screenCanvas.name} #{screenCanvas.GetInstanceID()} (first)");
+            }
+            else if (!ReferenceEquals(prevScreen, screenCanvas))
+            {
+                Mod.logger.LogInfo($"screenCanvas identity: {screenCanvas.name} #{screenCanvas.GetInstanceID()} (replaced {prevScreen.name} #{prevScreen.GetInstanceID()})");
+            }
             overlayCanvas = uGUI.main.overlays.gameObject.transform.parent;
             hud = uGUI.main.hud.transform;
 
@@ -120,20 +392,39 @@ namespace SubmersedVR
             screenCanvas.SetParent(uiCamera.transform, true);
             overlayCanvas.SetParent(uiCamera.transform, true);
 
-            //Makes the UI more comfortable to view
-            screenCanvas.transform.localScale = new Vector3(0.00072f, 0.00072f, 0.00072f);
+            // NO localScale pin on the screenCanvas: the game's UpdateFrustum
+            // owns it (frustum-based) but only writes it on a cache miss. A
+            // pinned value here survived the cache hit after each world reload
+            // and rendered the HUD at the wrong size until a transient
+            // uiScale drag forced a cache miss (the "HUD too small until you
+            // touch UI Scale" bug). The canvas size is driven by
+            // ApplyScreenCanvasScale (rect shrink + explicit localScale).
             overlayCanvas.transform.localScale = new Vector3(0.00032f, 0.00032f, 0.00032f);
             staticHudCanvas.transform.localScale = new Vector3(0.00085f, 0.00085f, 0.00085f);
+            if (!overlayScalerLogged)
+            {
+                overlayScalerLogged = true;
+                Mod.logger.LogInfo($"overlayCanvas has scaler: {overlayCanvas.GetComponent<uGUI_CanvasScaler>() != null}");
+            }
 
             SetupHandReticle(Settings.PutHandReticleOnLaserPointer, uiCamera, rightControllerUI);
             Settings.PutHandReticleOnLaserPointerChanged -= OnHandReticleSettingChanged;
             Settings.PutHandReticleOnLaserPointerChanged += OnHandReticleSettingChanged;
 
+            if (!uiScaleListenerRegistered)
+            {
+                uiScaleListenerRegistered = true;
+                uGUI_CanvasScaler.AddUIScaleListener(OnUiScaleChanged);
+            }
+
             WristHud.Setup();
 
             screenCanvas.GetComponent<uGUI_CanvasScaler>()?.SetDirty();
             screenCanvas.GetComponentsInChildren<uGUI_CanvasScaler>().ForEach(cs => cs.SetDirty());
-            MiscSettings.cameraBobbing = VROptions.enableCinematics; 
+            ApplyHudScale();
+            MiscSettings.cameraBobbing = VROptions.enableCinematics;
+
+            LogMenuCanvasIdentity();
         }
 
         public static void OnEnterVehicle()
@@ -637,6 +928,30 @@ namespace SubmersedVR
         public static void Postfix()
         {
             XRSettingsEnabled.isEnabled = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(uGUI_CanvasScaler), nameof(uGUI_CanvasScaler.UpdateFrustum))]
+    static class uGUI_CanvasScalerHudScale_Fixer
+    {
+        // Diagnostic: the signature dedup in ApplyScreenCanvasScale hides
+        // re-runs with an identical signature. Count the first UpdateFrustum
+        // runs of the screenCanvas in the main level to see whether the
+        // scaler re-runs at world entry at all, and when.
+        private static int mainLevelRunCount = 0;
+
+        public static void Postfix(uGUI_CanvasScaler __instance)
+        {
+            if (VRHud.screenCanvas == null || !ReferenceEquals(__instance.transform, VRHud.screenCanvas))
+            {
+                return;
+            }
+            if (uGUI.isMainLevel && mainLevelRunCount < 8)
+            {
+                mainLevelRunCount++;
+                Mod.logger.LogInfo($"screenCanvas frustum run #{mainLevelRunCount} t={Time.time:0.##}");
+            }
+            VRHud.ApplyScreenCanvasScale(__instance);
         }
     }
 

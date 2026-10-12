@@ -72,6 +72,10 @@ namespace SubmersedVR
             {
                 harmony.PatchAll();
                 Logger.LogInfo($"{PluginInfo.PLUGIN_NAME} loaded and patches applied!");
+                // Before the first scene (and its loading screen) is built:
+                // pull the saved HUD/loading values out of the options file
+                // so boot doesn't flash the C# defaults.
+                OptionsBootstrap.LoadEarlyFloats();
                 VROptions.gazeBasedCursor = true;
                 VROptions.aimRightArmWithHead = false;
             }
