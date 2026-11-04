@@ -103,6 +103,11 @@ namespace SubmersedVR
         public static bool EnableGameHaptics = true;
         public static bool EnableUIHaptics = true;
 
+        // Ported from the SN1 line (commit 45a0947): replaces the 2D
+        // head-locked teleport swirl with a raw-world blit + a world-locked
+        // 3D sphere (comfort: no full-screen head-following animation).
+        public static bool FixTeleportEffect = true;
+
         
 
         public static bool HandBasedTurning = false;
@@ -283,6 +288,7 @@ namespace SubmersedVR
             panel.AddChoiceOption<string>(tab, "Show Laser Pointer", new string[] {"Always", "Default", "Never"}, ShowLaserPointer , (value) => {
                 ShowLaserPointer = value;
             });
+            panel.AddToggleOption(tab, "Fix teleport effect in VR", FixTeleportEffect, (value) => { FixTeleportEffect = value; }, "Replaces the full-screen head-locked green teleport swirl with a world-locked 3D sphere around you (the game's door effect). The swirl causes eye strain in VR (the two eyes see incoherent images).");
 
             panel.AddHeading(tab, "HUD");
             panel.AddSliderOption(tab, "HUD Canvas Scale X", HudCanvasScaleX, 0.25f, 0.75f, HudDefaults.HudCanvasScaleX, 0.01f, (value) => { HudCanvasScaleX = value; VRHud.ApplyHudScale(); }, SliderLabelMode.Float, "0.00");

@@ -26,6 +26,14 @@ namespace SubmersedVR
 
         public static ManualLogSource logger;
         public static Mod instance;
+        // Set on application quit so per-frame patched code (teleport FX
+        // cycle tracking, ...) stops touching Unity objects mid-shutdown.
+        public static bool quitting;
+
+        private void OnApplicationQuit()
+        {
+            quitting = true;
+        }
 
         private bool IsSetupValid()
         {
