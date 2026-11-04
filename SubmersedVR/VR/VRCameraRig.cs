@@ -21,6 +21,10 @@ namespace SubmersedVR
     using System.Reflection.Emit;
     using System.CodeDom;
 
+    // Run before the game's ManagedUpdate canvas queues so the uiRig
+    // position is up to date when the Static canvases re-place themselves
+    // (uGUI_CanvasScalerStaticTrack_Fixer, 27/10) - no 1-frame panel lag
+    [DefaultExecutionOrder(-10)]
     class VRCameraRig : MonoBehaviour
     {
         // Setup and created in Start()
@@ -49,6 +53,7 @@ namespace SubmersedVR
         public Camera uiCamera = null;
         public GameObject worldTarget;
         public float worldTargetDistance;
+        public float worldTargetTime;
         public Transform rigParentTarget;
 
         public bool photoRequested = false;
@@ -502,6 +507,17 @@ namespace SubmersedVR
             {
                 this.transform.SetPositionAndRotation(rigParentTarget.position, rigParentTarget.rotation);
                 uiRig.transform.rotation = transform.rotation;
+                // SN1 parity (27/10): in SN1 the seated origin (the frame
+                // the controller poses are expressed in) coincided with the
+                // player because the base sat near the world origin, where
+                // StealUICamera pins the uiRig. In BZ the base is ~242 m
+                // from the world origin, so the whole UI space (uiCamera,
+                // UI controller, UI laser, menu raycasts, hand reticle
+                // anchor) was displaced by that much - the "trop bas"
+                // offset and the target info parallax. Follow the player so
+                // the SN1 geometry (UI space at the player, poses at the
+                // hands) is reproduced exactly.
+                uiRig.transform.position = rigParentTarget.position;
                 //Move the body to whereever the head is
                 if(uGUI_SpyPenguin.main.activePenguin == false)
                 {
@@ -518,6 +534,24 @@ namespace SubmersedVR
                 //Experimental player scaling
                 Player.main.armsController.transform.localScale = new Vector3(Settings.PlayerScale, Settings.PlayerScale, Settings.PlayerScale);        
                 Player.main.playerController.standheight = 1.5f * Settings.PlayerScale; 
+            }
+
+            // HandReticle is recreated on save/level load, possibly after
+            // VRHud.Setup already ran (it skipped a missing reticle):
+            // re-apply the configured mode whenever a new reticle instance
+            // shows. Target info additionally waits for the split to have
+            // succeeded (the game lays the reticle out a few frames after
+            // the load, the split must not freeze its zero state)
+            var handReticle = HandReticle.main;
+            if (handReticle != null)
+            {
+                bool applied = Settings.HandReticleMode == HandReticleModes.TargetInfo
+                    ? ReticleSplit.SplitRoot == handReticle.transform
+                    : VRHud.SetupReticle == handReticle.transform;
+                if (!applied)
+                {
+                    VRHud.SetupHandReticle(Settings.HandReticleMode, uiCamera, rightControllerUI.transform);
+                }
             }
         }
 
@@ -556,7 +590,15 @@ namespace SubmersedVR
         {
             this.worldTarget = activeTarget;
             this.worldTargetDistance = activeHitDistance;
+            this.worldTargetTime = Time.unscaledTime;
             this.laserPointerUI.SetWorldTarget(worldTarget, worldTargetDistance);
+        }
+
+        // True while the aim is on a targetable object, with the same 0.5 s
+        // timeout the laser pointer uses for its dot
+        public bool HasWorldTarget()
+        {
+            return worldTarget != null && Time.unscaledTime - worldTargetTime < 0.5f;
         }
     }
 
@@ -707,6 +749,8 @@ namespace SubmersedVR
     [HarmonyPatch(typeof(uGUI_CanvasScaler), nameof(uGUI_CanvasScaler.UpdateTransform))]
     static class uGUI_CanvasScalerPDA_Attach
     {
+        static bool pdaRenderModeLogged;
+
         public static void Postfix(uGUI_CanvasScaler __instance)
         {
              // TODO: There gotta be a better way to attach this only to the PDA, maybe custom behaviour, disabling the Scalar?
@@ -716,15 +760,26 @@ namespace SubmersedVR
             }
             if (VRCameraRig.instance == null)
                 return;
-            var rigWorldPos = SNCameraRoot.main.transform;
-
+            if (__instance._anchor == null)
+                return;
+            // BZ (27/10): the UI space follows the player (uiRig at the player
+            // position), so the screen is placed in WORLD space on the PDA
+            // device (the ScreenAnchor bone in the character's hand), like the
+            // non-VR game. The old SN1 origin remap (worldPos - playerPos)
+            // left the screen 242 m behind the ui camera in BZ.
             var worldPos = __instance._anchor.transform.position;
             var worldRot = __instance._anchor.transform.rotation;
-            var uiSpacePos = worldPos - rigWorldPos.position;
-            var uiSpaceRotation = worldRot;
-            // DebugPanel.Show($"PDA Pos/Rot: {worldPos}/{worldRot.eulerAngles}\n -> {uiSpacePos}/{uiSpaceRotation.eulerAngles}\nrigPos/rot: {rigWorldPos.position}, {rigWorldPos.eulerAngles}");
-            __instance.rectTransform.position = uiSpacePos;
-            __instance.rectTransform.rotation = uiSpaceRotation;
+            __instance.rectTransform.position = worldPos;
+            __instance.rectTransform.rotation = worldRot;
+            // One-shot: confirm the canvas render mode the fix assumes
+            // (WorldSpace) and which camera renders it
+            if (Settings.IsDebugEnabled && !pdaRenderModeLogged)
+            {
+                pdaRenderModeLogged = true;
+                var pdaCanvas = __instance.canvas;
+                string pdaCam = pdaCanvas.worldCamera != null ? pdaCanvas.worldCamera.name : "null";
+                Mod.logger.LogInfo($"[PDAAttach] renderMode={pdaCanvas.renderMode} worldCamera={pdaCam} pos={CinematicsDiagnostics.FmtP(worldPos)}");
+            }
         }
     }
 

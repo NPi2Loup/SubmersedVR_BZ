@@ -11,6 +11,9 @@ namespace SubmersedVR
 
     // This class implements a way to switch between tools on the quickbar using a radial menu.
     // It was inspired by the Inventory/Quick Select form Half Life: Alyx.
+    // Ordered after VRCameraRig (-10) so LateUpdate reads the uiRig position
+    // of the current frame (no 1-frame wheel lag at vehicle speed).
+    [DefaultExecutionOrder(10)]
     public class VRQuickSlots : uGUI_QuickSlots
     {
         private bool setup = false;
@@ -26,6 +29,12 @@ namespace SubmersedVR
         public int lastSlot = -1;
         private int currentSlot = -2;
         private Canvas canvas;
+        // Offset of the wheel from the uiRig, captured at open time (the hand
+        // pose). Re-applied every frame so the wheel follows the player
+        // translation (walking, vehicles) WITHOUT inheriting the uiRig
+        // rotation (head facing) - it must not orbit with the head, and it
+        // must not follow the hand (hand movement drives the selection)
+        private Vector3 wheelOffset;
 
         private int nSlots
         {
@@ -233,11 +242,29 @@ namespace SubmersedVR
             }
 
             this.transform.LookAt(targetPos);
+            if (VRCameraRig.instance != null && VRCameraRig.instance.uiRig != null)
+            {
+                wheelOffset = transform.position - VRCameraRig.instance.uiRig.transform.position;
+            }
 
             currentSlot = -2;
             lastSlot = -1;
             active = true;
             FPSInputModule.current.lockRotation = true;
+        }
+
+        void LateUpdate()
+        {
+            if (!active || VRCameraRig.instance == null || VRCameraRig.instance.uiRig == null)
+            {
+                return;
+            }
+            // Translation follow only: the position tracks the player (the
+            // uiRig follows it each frame), the rotation set in Activate
+            // (LookAt the head) stays world-fixed like the committed
+            // behavior. The wheel must not rotate with the head, otherwise
+            // it would orbit the face and detach from the hand pose.
+            transform.position = VRCameraRig.instance.uiRig.transform.position + wheelOffset;
         }
         public void Deactivate(SteamVR_Action_Boolean fromAction, SteamVR_Input_Sources fromSource)
         {

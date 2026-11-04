@@ -19,14 +19,7 @@ namespace SubmersedVR
     // Tweaks regarding the cinematics in VR mode of the game
     static class CinematicsVR
     {
-        /*
         public static bool hasSlept = false;
-        static public IEnumerator DelayedCancel(PlayerCinematicController __instance, float delay)
-        {
-            yield return new WaitForSeconds(delay);
-            __instance.OnPlayerCinematicModeEnd();
-        }
-        */
     }
 
     #region Patches
@@ -39,18 +32,51 @@ namespace SubmersedVR
             string text = "vr_active";
             //Mod.logger.LogInfo($"PlayerCinematicController.SetVrActiveParam called animationMode={VRGameOptions.GetVrAnimationMode()}");
             bool vrAnimationMode = VRGameOptions.GetVrAnimationMode();
-            if (__instance.animator != null)
+            try
             {
-                __instance.animator.SetBool(text, vrAnimationMode);
-            }
-            for (int i = 0; i < __instance.animParamReceivers.Length; i++)
-            {
-                IAnimParamReceiver component = __instance.animParamReceivers[i].GetComponent<IAnimParamReceiver>();
-                if (component != null)
+                if (__instance.animator != null)
                 {
-                    component.ForwardAnimationParameterBool(text, vrAnimationMode);
+                    __instance.animator.SetBool(text, vrAnimationMode);
+                }
+                for (int i = 0; i < __instance.animParamReceivers.Length; i++)
+                {
+                    IAnimParamReceiver component = __instance.animParamReceivers[i].GetComponent<IAnimParamReceiver>();
+                    if (component != null)
+                    {
+                        component.ForwardAnimationParameterBool(text, vrAnimationMode);
+                    }
                 }
             }
+            catch (System.Exception e)
+            {
+                Mod.logger.LogWarning($"SetVrActiveParamFixer: receiver failed: {e}");
+            }
+        }
+    }
+
+    // In VR a skipped cinematic must still teleport the player to its
+    // endTransform: on desktop the animation itself moves the player, but in
+    // VR the rig does not follow the cinematic camera. The game's
+    // onlyUseEndTransformInVr flag gates that teleport on
+    // GetVrAnimationMode(), which is FALSE in static VR mode - so the exit
+    // cinematics (hatch_end_anim exit_end, model ladder_out) skipped with
+    // "NOT MOVED" and the player stayed in the base (27/10 log). Force the
+    // endTransform teleport whenever VR is active.
+    [HarmonyPatch(typeof(PlayerCinematicController), nameof(PlayerCinematicController.UseEndTransform))]
+    public static class UseEndTransformVrFix
+    {
+        // bool prefix (NOT void): returning false both skips the original
+        // and makes __result the return value - unambiguous Harmony
+        // semantics (a void prefix still runs the original).
+        public static bool Prefix(PlayerCinematicController __instance, ref bool __result)
+        {
+            if (!__result && __instance.endTransform != null && XRSettings.enabled)
+            {
+                __result = true;
+                Mod.logger.LogInfo($"[Cine] UseEndTransform forced true in VR (name={__instance.gameObject.name})");
+                return false;
+            }
+            return true;
         }
     }
 
@@ -66,13 +92,13 @@ namespace SubmersedVR
             component.position = __instance.animatedTransform.position;
             component2.position = __instance.player.camAnchor.position;
         
-            //disabling head rotation for these cinematics do not work well           
-            bool enableRotation = __instance.gameObject.name == "seatruck_module_sleeper_anim" //going to sleep
-                || __instance.gameObject.name == "IntroCinematics(Clone)" //Planet crash landing
-                || __instance.gameObject.name == "submarine_hatch_02_doorway_01_cin2" //entering base through the seatruck bay hatch
-                || __instance.gameObject.name == "Top_Left_Collision"   //going down the ladder at the radio tower
-                || __instance.gameObject.name == "Top_Right_Collision";  //going down the ladder at the radio tower
-            if(enableRotation || VROptions.enableCinematics)
+            // 28/10 spec section 3: rotation rule from the code table -
+            // legacy (checked) always copies rotation (unchanged);
+            // unchecked: Play = with rotation ("as intended"),
+            // PlayNoRot/Skip = without. Unknown default = Play.
+            bool enableRotation = VROptions.enableCinematics
+                || CinematicsTable.Get(__instance.gameObject.name).Mode == CineMode.Play;
+            if (enableRotation)
             {
                 component.rotation = __instance.animatedTransform.rotation;
                 component2.rotation = __instance.animatedTransform.rotation;
@@ -125,23 +151,78 @@ namespace SubmersedVR
                 return false;
             }
 
-            Mod.logger.LogInfo($"StartCinematicMode name = {__instance.gameObject.name} playInVR = {__instance.playInVr} cinematicsEnabled = {VROptions.enableCinematics} "); 
-            bool canSkip = __instance.gameObject.name == "Drop_Pod_anim" //entering/exiting the drop pod
-                        //|| __instance.gameObject.name == "model"
-                        || __instance.gameObject.name == "precursor_teleporter_cin"; //after going through the teleporter in the end sequences
-            bool mustSkip = __instance.gameObject.name == "IntroCinematics(Clone)" && VROptions.skipIntro //The intro
-                        || __instance.gameObject.name == "Necklace_Scene_Placements"; //picking up Sam's necklace
+            //Ported from the SMB line: the bay's dock-ride controllers
+            //(DockPlayerCinematic / exosuit, animator = moon_pool_anim) carry
+            //the player to the docked position. Their clip runs 15s+ at 1x and
+            //ends on an AnimationEvent.
+            bool isDockCinematic = __instance.GetComponentInParent<VehicleDockingBay>() != null
+                || (__instance.animator != null && __instance.animator.gameObject.name.Contains("moon_pool"));
+            //Orphan guard: a dock ride started without a player (a save loaded
+            //mid-dock replays the dock completion; the dock animation and its
+            //end event do not replay) can never end. It would pin the static
+            //cinematicModeCount > 0 forever, blocking every gated useable
+            //(seatruck hatch, base entry, PDA, ...) and blocking saves. Do not
+            //start the ride; settle the dockable instead so a stuck
+            //isInTransition state is cleared.
+            if (isDockCinematic && !setplayer)
+            {
+                Mod.logger.LogInfo($"{__instance.gameObject.name}: dock ride requested with no player (mid-dock save?) -> ride not started, settling dockable");
+                var docked = CinematicFallbackWatcher.FindDockedTruck();
+                if (docked != null)
+                {
+                    docked.OnDockingComplete();
+                }
+                return false;
+            }
 
+            CinematicsDiagnostics.LogStart(__instance, setplayer);
+            Mod.logger.LogInfo($"StartCinematicMode name = {__instance.gameObject.name} playInVR = {__instance.playInVr} cinematicsEnabled = {VROptions.enableCinematics} ");
             __instance.player = null;
-            if ((!__instance.playInVr && !VROptions.enableCinematics && canSkip) || mustSkip )
+            // 28/10 spec section 2: per-cinematic rules in the code
+            // (CinematicsTable) replace the hard-coded skip list. Unknown =
+            // Play (legacy) + contract capture. playInVr=true is never
+            // skipped (current semantics). The sleeper toggle is unchanged
+            // and applies in both modes.
+            string name = __instance.gameObject.name;
+            bool legacy = VROptions.enableCinematics;
+            bool skipIntro = name == "IntroCinematics(Clone)" && VROptions.skipIntro;
+            bool sleeperSkip = false;
+            if (name == "seatruck_module_sleeper_anim")
+            {
+                sleeperSkip = CinematicsVR.hasSlept;
+                CinematicsVR.hasSlept = !CinematicsVR.hasSlept;
+            }
+            bool tableSkip = !legacy && !__instance.playInVr
+                && CinematicsTable.Get(name).Mode == CineMode.Skip;
+            if (skipIntro || sleeperSkip || tableSkip)
             {
                 if (__instance.debug)
                 {
-                    Debug.Log(__instance.gameObject.name + " skip cinematic");
+                    Debug.Log(name + " skip cinematic");
                 }
-                Mod.logger.LogInfo(__instance.gameObject.name + " skipping cinematic");          
+                Mod.logger.LogInfo($"[Cine] SKIP-DECISION name={name} intro={skipIntro} sleeper={sleeperSkip} table={tableSkip}");
                 __instance.SkipCinematic(setplayer);
                 return false;
+            }
+            // Played path (spec section 2): goal listener on ALL played
+            // paths. 28/10 build 2: the no-director accel fallback is gone -
+            // the watchdog applies Animator.speed to animator-only cinematics.
+            CinematicsDiagnostics.CineGoalListener.currentCine = __instance;
+            CinematicsDiagnostics.CineGoalListener.Add();
+            //Ported from the SMB line: the seatruck entry/exit rides also play
+            //the player MODEL's sit/stand transition (playerViewAnimationName,
+            //e.g. 'seatruck_drive_in') at 1x -- clearly visible on re-entry.
+            //Speed the player's animators up for a 5s window covering the
+            //transition, then restore. Safe: the body sit/stand clips carry no
+            //gameplay events (the sitting state is set by the flow, not by an
+            //animation event), so no desync risk. (Dock rides are handled by
+            //the table: their animator runs at the table speed until the
+            //ride's native end event.)
+            bool isSeatruckCinematic = __instance.GetComponentInParent<SeaTruckAnimation>() != null;
+            if (XRSettings.enabled && isSeatruckCinematic && !isDockCinematic && setplayer != null)
+            {
+                CinematicFallbackWatcher.EnsureBehaviour().StartCoroutine(CinematicFallbackWatcher.PlayerTransitionSpeedUp(setplayer));
+                Mod.logger.LogInfo($"{name}: player sit/stand transition at 500x for 5s (playerViewAnim='{__instance.playerViewAnimationName}')");
             }
             if (__instance.animator != null)
             {
@@ -212,7 +293,156 @@ namespace SubmersedVR
         }
     }
 
-/*
+    //Ported from the SMB line: Prawn Suit (internal class name: Exosuit)
+    //entry/exit. Unlike the SeaTruck (whose entry/exit is a
+    //PlayerCinematicController = seatruck_anim), the Prawn's entry/exit is NOT
+    //a cinematic: Vehicle.EnterVehicle teleports the player into the cockpit
+    //(EnterLockedMode) and flips player.sitting, so the player MODEL's
+    //sit/stand transition plays at 1x in VR -- the same "visible" issue as the
+    //SeaTruck's re-entry. Apply the same PlayerTransitionSpeedUp (500x for
+    //5s) on both. Enter hooks Exosuit.EnterVehicle (its override, so
+    //Prawn-specific). Exit: the Prawn sits in LockedPiloting mode and every
+    //exit funnels through Player.ExitLockedMode (TryEject -> ToNormalMode ->
+    //ExitLockedMode); filter there on currentMountedVehicle being an Exosuit
+    //(still set in the prefix -- the method nulls it internally). Safe: body
+    //sit/stand clips carry no gameplay events.
+    [HarmonyPatch(typeof(Exosuit), "EnterVehicle", new[] { typeof(Player), typeof(bool), typeof(bool) })]
+    static class ExosuitEnterSitTransition
+    {
+        static void Postfix(Exosuit __instance, Player player)
+        {
+            if (player == null || !XRSettings.enabled)
+            {
+                return;
+            }
+            Mod.logger.LogInfo("[Exosuit] enter -> player sit transition at 500x for 5s");
+            CinematicFallbackWatcher.EnsureBehaviour().StartCoroutine(CinematicFallbackWatcher.PlayerTransitionSpeedUp(player));
+        }
+    }
+
+    [HarmonyPatch(typeof(Player), nameof(Player.ExitLockedMode))]
+    static class ExosuitExitSitTransition
+    {
+        static void Prefix(Player __instance)
+        {
+            if (__instance == null || !(__instance.currentMountedVehicle is Exosuit) || !XRSettings.enabled)
+            {
+                return;
+            }
+            Mod.logger.LogInfo("[Exosuit] exit -> player stand transition at 500x for 5s");
+            CinematicFallbackWatcher.EnsureBehaviour().StartCoroutine(CinematicFallbackWatcher.PlayerTransitionSpeedUp(__instance));
+        }
+    }
+
+    //Ported from the SMB line: when a SeaTruck docks at a base bay while the
+    //player is piloting, the game's bay flow transfers the player (unparent +
+    //ToNormalMode + dockPlayerCinematic) but never calls
+    //SeaTruckMotor.StopPiloting: motor.piloting and
+    //Player.main.inSeatruckPilotingChair stay true, so the player model keeps
+    //the piloting pose ("piloting_seatruck" bool) and movement input is still
+    //routed to the docked (immobile) truck -- the player is left with dead
+    //keys. Stop the piloting when the docked segment's motor is piloted: the
+    //player is released to normal mode at the seat (ExitLockedMode), then the
+    //bay's player transfer + dock cinematic take over and end with the player
+    //free in the bay.
+    [HarmonyPatch(typeof(Dockable), nameof(Dockable.SetDocked), new[] { typeof(IDockingBay), typeof(Vehicle.DockType) })]
+    static class SeatruckDockPilotCleanup
+    {
+        static void Postfix(Dockable __instance, IDockingBay bay)
+        {
+            if (bay == null || __instance == null || __instance.truckMotor == null)
+            {
+                return;
+            }
+            if (!__instance.truckMotor.IsPiloted())
+            {
+                return;
+            }
+            Mod.logger.LogInfo("SeatruckDockPilotCleanup: seatruck docked while piloting -> StopPiloting(forceStop) to release the pilot state");
+            __instance.truckMotor.StopPiloting(waitForDocking: false, forceStop: true);
+        }
+    }
+
+    //Ported from the SMB line (trimmed): the coroutine host + the helpers the
+    //re-applied fixes need. The SMB full watcher (Schedule/Watch safety nets,
+    //DockModeOverride, DockSequenceSpeed) is intentionally NOT ported: on this
+    //base GetVrAnimationMode is permanently false (the desktop flow), the
+    //watchdog (CinematicsDiagnostics) owns the accelerated-ride safety nets
+    //(speed reset + STUCK force-end) and the per-cinematic speeds live in
+    //CinematicsTable.
+    static class CinematicFallbackWatcher
+    {
+        static FallbackBehaviour behaviour;
+
+        public static FallbackBehaviour EnsureBehaviour()
+        {
+            if (behaviour == null || !behaviour)
+            {
+                var go = new GameObject("CinematicFallbackWatcher");
+                UnityEngine.Object.DontDestroyOnLoad(go);
+                behaviour = go.AddComponent<FallbackBehaviour>();
+            }
+            return behaviour;
+        }
+
+        public class FallbackBehaviour : MonoBehaviour
+        {
+        }
+
+        //First docked truck found among the bays. The dock-ride controllers are
+        //not children of the bay, so this is the only reliable lookup.
+        public static Dockable FindDockedTruck()
+        {
+            var bays = UnityEngine.Object.FindObjectsOfType<VehicleDockingBay>();
+            if (bays == null)
+            {
+                return null;
+            }
+            foreach (var b in bays)
+            {
+                if (b != null)
+                {
+                    var d = b.GetDockedObject();
+                    if (d != null)
+                    {
+                        return d;
+                    }
+                }
+            }
+            return null;
+        }
+
+        //500x the player MODEL's animators for ~5s (a seatruck entry/exit
+        //sit/stand transition, e.g. 'seatruck_drive_in': climb up to the
+        //cockpit + sit, ~3-4s at 1x). ALL child animators: the first
+        //version used GetComponentInChildren (first child in hierarchy
+        //order -- often a hand-rig/PDA animator, not the body), so the body
+        //pose anim (the visible "climb up and sit") still played at 1x.
+        //The 5s window covers the state transition + the one-shot clip at
+        //500x (it finishes in ~8ms); long-lived seated states are holds
+        //(no visible effect), and the speed is restored after the window.
+        public static System.Collections.IEnumerator PlayerTransitionSpeedUp(Player player)
+        {
+            var anims = player.GetComponentsInChildren<Animator>();
+            foreach (var a in anims)
+            {
+                if (a != null)
+                {
+                    a.speed = 500f;
+                }
+            }
+            yield return new WaitForSeconds(5f);
+            foreach (var a in anims)
+            {
+                if (a != null)
+                {
+                    a.speed = 1f;
+                }
+            }
+        }
+    }
+
+ /*
     [HarmonyPatch(typeof(PlayerCinematicController), nameof(PlayerCinematicController.InitDirector))]
     public static class InitDirectorFixer
     {
@@ -346,11 +576,9 @@ namespace SubmersedVR
             bool skipIntro = __instance.gameObject.name == "IntroCinematics(Clone)" && VROptions.skipIntro;
             //Do not skip these or else actions won't happen or the story wont progress
             bool skipAnimations = !__instance.playInVr && VRGameOptions.GetVrAnimationMode() 
-                //&& __instance.gameObject.name != "model" //enter/exit base climbing ladder (breaks game)
                 && __instance.gameObject.name != "submarine_hatch_02_doorway_01_cin2" //enter/exit base through sub bay  
                 //&& __instance.gameObject.name != "hatch_side_anim" //enter/exit base through hatch (can be skipped)                          
                 && __instance.gameObject.name != "seatruck_anim" //enter/exit SeaTruck Motor section when not docked with base
-                && __instance.gameObject.name != "seatruck_module_prawn_anim" //enter/exit SeaTruck Prawn module
                 && __instance.gameObject.name != "seatruck_module_sleeper_anim" //when exiting the animation it puts the player on the ceiling and disables all input              
                 && __instance.gameObject.name != "Top_Left_Collision" && __instance.gameObject.name != "Top_Right_Collision" && __instance.gameObject.name != "Bottom_Collision" //ladder for comm tower                
                 && __instance.gameObject.name != "MaintenanceBox" // Animation of installing the maintence override (has a clipping issue slot0011)
