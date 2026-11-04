@@ -507,6 +507,9 @@ namespace SubmersedVR
             {
                 this.transform.SetPositionAndRotation(rigParentTarget.position, rigParentTarget.rotation);
                 uiRig.transform.rotation = transform.rotation;
+                // 31/10: keep the teleport sphere centered on the view in
+                // the same frame the rig moves (see TeleportSphere3D)
+                TeleportSphere3D.SyncCenterToView();
                 // SN1 parity (27/10): in SN1 the seated origin (the frame
                 // the controller poses are expressed in) coincided with the
                 // player because the base sat near the world origin, where
