@@ -1,4 +1,6 @@
-﻿using System.Reflection;
+using System;
+using System.Collections.Generic;
+using System.Reflection;
 using HarmonyLib;
 using UnityEngine;
 using UnityEngine.Events;
@@ -13,6 +15,7 @@ namespace SubmersedVR
         public delegate void BooleanChanged(bool newValue);
         public delegate void FloatChanged(float newValue);
         public delegate void VoidChanged();
+        public delegate void StringChanged(string newValue);
 
         public static bool IsSnapTurningEnabled;
         public static event BooleanChanged IsSnapTurningEnabledChanged;
@@ -62,6 +65,8 @@ namespace SubmersedVR
 
         public static bool PutHandReticleOnLaserPointer;
         public static event BooleanChanged PutHandReticleOnLaserPointerChanged;
+        public static string HandReticleMode = HandReticleModes.Legacy;
+        public static event StringChanged HandReticleModeChanged;
 
         public static bool PutBarsOnWrist;
         public static event BooleanChanged PutBarsOnWristChanged;
@@ -78,6 +83,22 @@ namespace SubmersedVR
         // public static float HudDistance = 1.0f;
         // public static event FloatChanged HudDistanceChanged;
         public static float PlayerScale = 1.0f;
+        public static float HudCanvasScaleX = HudDefaults.HudCanvasScaleX;
+        public static float HudCanvasScaleY = HudDefaults.HudCanvasScaleY;
+        // Ported from the SMB line (2026-10-18): the in-vehicle HUD parity
+        // multiplier on top of the screen-canvas frustum scale.
+        public static float VehicleHudScale = HudDefaults.VehicleHudScale;
+        public static float HudOffsetX = 0.0f;
+        public static float HudOffsetY = -10.0f;
+        // 28/10: the SpyPenguin HUD is pinned to the robot (world) instead of
+        // head-locked; this toggle restores the original head-locked HUD.
+        public static bool SpyPenguinHudOnRobot = true;
+        // Vertical offset (cm) of the robot HUD panel (and the view
+        // camera) relative to the robot's camera height. 28/10: the user
+        // calibrated +40 cm as the right level -> default.
+        public static float SpyPenguinHudHeightOffset = 40.0f;
+        public static bool VrUiScaleDefaultApplied = false;
+        public static bool PreMigrationValuesRestored = false;
 
         public static bool EnableGameHaptics = true;
         public static bool EnableUIHaptics = true;
@@ -141,6 +162,10 @@ namespace SubmersedVR
             string ns = nameof(SubmersedVR);
             foreach (var p in typeof(Settings).GetFields(BindingFlags.Static | BindingFlags.Public))
             {
+                // const/readonly fields are not persistable: on Mono SetValue
+                // throws FieldAccessException and would abort the whole loop.
+                if (p.IsLiteral || p.IsInitOnly) continue;
+
                 string name = p.Name;
                 var value = p.GetValue(null);
                 switch (value)
@@ -161,7 +186,7 @@ namespace SubmersedVR
                         p.SetValue(null, serializer.Serialize($"{ns}/{name}", val));
                         break;
                     default:
-                        Mod.logger.LogError($"Can't save/load setting {name} with type {value.GetType()}");
+                        Mod.logger.LogDebug($"Skipping non persistable setting {name} (type {value.GetType()})");
                         break;
                 }
             }
@@ -259,20 +284,31 @@ namespace SubmersedVR
                 ShowLaserPointer = value;
             });
 
+            panel.AddHeading(tab, "HUD");
+            panel.AddSliderOption(tab, "HUD Canvas Scale X", HudCanvasScaleX, 0.25f, 0.75f, HudDefaults.HudCanvasScaleX, 0.01f, (value) => { HudCanvasScaleX = value; VRHud.ApplyHudScale(); }, SliderLabelMode.Float, "0.00");
+            panel.AddSliderOption(tab, "HUD Canvas Scale Y", HudCanvasScaleY, 0.25f, 0.75f, HudDefaults.HudCanvasScaleY, 0.01f, (value) => { HudCanvasScaleY = value; VRHud.ApplyHudScale(); }, SliderLabelMode.Float, "0.00");
+            panel.AddSliderOption(tab, "HUD Offset X (cm)", HudOffsetX, -100f, 100f, 0f, 1f, (value) => { HudOffsetX = value; VRHud.ApplyHudScale(); }, SliderLabelMode.Float, "0");
+            panel.AddSliderOption(tab, "HUD Offset Y (cm)", HudOffsetY, -100f, 100f, -10f, 1f, (value) => { HudOffsetY = value; VRHud.ApplyHudScale(); }, SliderLabelMode.Float, "0");
+            panel.AddSliderOption(tab, "Vehicle HUD Scale", VehicleHudScale, 0.5f, 3f, HudDefaults.VehicleHudScale, 0.05f, (value) => { VehicleHudScale = value; VRHud.ApplyHudScale(); }, SliderLabelMode.Float, "0.00", "Size of the HUD while piloting a vehicle (it stays anchored to the vehicle, not the view). 1.0 = same size as the on-foot HUD.");
+            panel.AddToggleOption(tab, "SpyPenguin HUD on robot", SpyPenguinHudOnRobot, (value) => { SpyPenguinHudOnRobot = value; if (!value) SpyPenguinWorldHud.Detach(); }, "Pins the SpyPenguin HUD to the robot (in the world) while piloting. Disable to get the original head-locked HUD in front of you.");
+            panel.AddSliderOption(tab, "SpyPenguin HUD Height (cm)", SpyPenguinHudHeightOffset, -100f, 100f, 40f, 1f, (value) => { SpyPenguinHudHeightOffset = value; }, SliderLabelMode.Float, "0");
+
             panel.AddHeading(tab, "Experimental");
             panel.AddToggleOption(tab, "Full Body", FullBody, (value) => { FullBody = value; FullBodyChanged(value); }, "See the full body instead of just the hands and feet.");
             panel.AddSliderOption(tab, "Body Scale", PlayerScale, 0.8f, 1.2f, PlayerScale, 0.01f, (value) => { PlayerScale = value; }, SliderLabelMode.Float, "0.00");
-            panel.AddToggleOption(tab, "Put hand reticle on laserpointer end", PutHandReticleOnLaserPointer, (value) => { PutHandReticleOnLaserPointer = value; PutHandReticleOnLaserPointerChanged(value); });
+            panel.AddChoiceOption<string>(tab, "Hand reticle mode", new string[] { HandReticleModes.Legacy, HandReticleModes.PointerEnd, HandReticleModes.TargetInfo }, HandReticleMode, (value) => { HandReticleMode = value; HandReticleModeChanged?.Invoke(value); }, "Legacy hand reticle: all reticle info at the hand, original layout. Put hand reticle on laserpointer end: the whole reticle follows the laser pointer dot (hidden with it when there is no target). Put target info on laserpointer end: while aiming, the target action texts, icon and progress are projected on the laser hit point, the rest stays at the hand.");
+
             panel.AddToggleOption(tab, "Invert Y Axis in Seamoth/Cameras", InvertYAxis, (value) => { InvertYAxis = value; InvertYAxisChanged(value); }, "Enables Y axis inversion for Seamoth and Cameras.");
 
             panel.AddHeading(tab, "Hidden/Advanced VR Settings(Those can cause motion sickness!)");
             panel.AddToggleOption(tab, "Enable pitching(Looking Up/Down) while diving", !VROptions.disableInputPitch, (value) => { VROptions.disableInputPitch = !value; }, "This allows you to pitch up and down using the right thumbstick when diving. Can be very disorienting! I recommend to keep this disabled!");
-            panel.AddToggleOption(tab, "Enable desktop cinematics", VROptions.enableCinematics, (value) => { VROptions.enableCinematics = value; }, "Enables the games cinematics. Warning! Those move around your head and can cause motion sickness!");
+            panel.AddToggleOption(tab, "Enable desktop cinematics", VROptions.enableCinematics, (value) => { VROptions.enableCinematics = value; }, "Checked = legacy: all cinematics played with rotation. Unchecked = per-cinematic rules (code table CinematicsTable): unknown cinematics are played + logged, table entries can skip / accelerate / play without rotation. Warning! Cinematics move your head and can cause motion sickness!");
             panel.AddToggleOption(tab, "Skip intro", VROptions.skipIntro, (value) => { VROptions.skipIntro = value; }, "Skip the intro when starting a new game.");
 
             panel.AddHeading(tab, "Debug Options");
             panel.AddToggleOption(tab, "Debug Overlays", IsDebugEnabled, (value) => { IsDebugEnabled = value; IsDebugChanged(value); }, "Enables Debug Overlays and Logs.");
             panel.AddToggleOption(tab, "Always show controllers", AlwaysShowControllers, (value) => { AlwaysShowControllers = value; AlwaysShowControllersChanged(value); }, "Shows the controllers at all times.");
+            panel.AddButton(tab, SeaTruckWatchdog.RescueButtonLabel, () => SeaTruckWatchdog.RescueNow());
             //panel.AddToggleOption(tab, "Always show laserpointer", AlwaysShowLaserPointer, (value) => { AlwaysShowLaserPointer = value; AlwaysShowLaserPointerChanged(value); }, "Show the laserpointer at all times.");
 
             tab = panel.AddTab("Vehicles VR");
@@ -334,6 +370,24 @@ namespace SubmersedVR
             panel.AddToggleOption(tab, "Invert Accelerator", SnowbikeAltAccelerator, (value) => { SnowbikeAltAccelerator = value;  }, "Twist forward to accelerate.");
 
         }
+
+        // The game stores the UI scale twice: MiscSettings.uiScale (Default
+        // display mode) and uiScaleHandheld (Handheld). Every platform
+        // service of this build reports DisplayOperationMode.Default, so only
+        // the Default field is ever read at runtime - but load writes both
+        // fields from the file and save writes both back, so a diverged
+        // legacy file (Default=0.5 / Handheld=0.75) would keep resaving the
+        // stale Handheld value. Keep the two file fields equal to the
+        // (Default) value the game actually uses.
+        internal static void CanonicalizeUiScale()
+        {
+            float def = MiscSettings.GetUIScale(DisplayOperationMode.Default);
+            float hand = MiscSettings.GetUIScale(DisplayOperationMode.Handheld);
+            if (!Mathf.Approximately(def, hand))
+            {
+                MiscSettings.SetUIScale(def, DisplayOperationMode.Handheld);
+            }
+        }
     }
 
     #region Patches
@@ -345,6 +399,23 @@ namespace SubmersedVR
         public static void Postfix(GameSettings.ISerializer serializer)
         {
             Settings.Serialize(serializer);
+            // One-shot migration (ported from the SN1 mod): the old
+            // experimental WIP toggle mapped to the whole-reticle-on-pointer-
+            // end mode. On a load with that key set the mode is migrated,
+            // and the orphan key is re-written to false.
+            if (Settings.HandReticleMode == HandReticleModes.Legacy && Settings.PutHandReticleOnLaserPointer)
+            {
+                Settings.HandReticleMode = HandReticleModes.PointerEnd;
+                Settings.PutHandReticleOnLaserPointer = false;
+            }
+            // 27/10: the value one-shot was removed. It fired on the early
+            // options SAVE (before the async load completed) and re-ran on the
+            // 27/10 boot, overwriting the user's canvas values (0.4/0.45) with
+            // 0.45/0.40. All values are now stable in the file: canvas = the
+            // user's own, loading screen scale = no longer an option (hard-coded
+            // 1.0 in VRLoadingScreen, 28/10), vanilla UI Scale = 0.8, debug =
+            // user's choice. The PreMigrationValuesRestored field is kept for
+            // serialization compatibility only.
         }
     }
 
@@ -369,6 +440,136 @@ namespace SubmersedVR
         }
     }
 
+    // The vanilla UI Scale slider (General tab) uses the legacy 0.7-1.4 range
+    // with a default of 1.0. Rewrite the AddSliderOption arguments before the
+    // slider is built so the range (0.5-1) and the step exist before
+    // slider.value is assigned: the game's AddSliderOption sets the value
+    // before the step (prefab step = 1), which made every later range change
+    // clamp the transient value through Set() and fire the already-connected
+    // vanilla callback into MiscSettings (the 0.75/0.7 poisoning, sessions
+    // 22:12-00:0x). With the correct args up front, the only fire is
+    // FixSliderInitialValue's own re-apply of the real value, which writes
+    // the correct value.
+    // VrUiScaleDefaultApplied memorizes the one-time migration of legacy
+    // values (vanilla 1.0 / handheld 1.4 defaults) to the VR friendly
+    // default, after which the user keeps ownership.
+    [HarmonyPatch(typeof(uGUI_TabbedControlsPanel), "AddSliderOption", new Type[] { typeof(int), typeof(string), typeof(float), typeof(float), typeof(float), typeof(float), typeof(float), typeof(UnityAction<float>), typeof(SliderLabelMode), typeof(string), typeof(string) })]
+    static class FixUiScaleSliderArgs
+    {
+        public static void Prefix(string label, ref float value, ref float minValue, ref float maxValue, ref float defaultValue, ref float step)
+        {
+            if (label != "UIScale")
+            {
+                return;
+            }
+            if (!Settings.VrUiScaleDefaultApplied && (value < 0.5f || value > 1f))
+            {
+                Settings.VrUiScaleDefaultApplied = true;
+                value = HudDefaults.VrUiScale;
+            }
+            else
+            {
+                value = Mathf.Clamp(value, 0.5f, 1f);
+            }
+            minValue = 0.5f;
+            maxValue = 1f;
+            defaultValue = HudDefaults.VrUiScale;
+            step = 0.01f;
+        }
+    }
+
+    // The game's AddSliderOption sets slider.value before slider.step and slider.defaultValue,
+    // so uGUI_SnappingSlider.SnapValue snaps the displayed value to the prefab defaults
+    // (step=1, defaultValue=1.0 — the class initializer 0.5f is overridden by the prefab,
+    // proven by the v13 log: pre=1 on every build) instead of the saved value.
+    // Re-applying the value via unsnappedValue (which calls the base Slider.Set, bypassing the
+    // snapping) makes the slider display the actual saved value when the options are reopened.
+    // For the UI Scale slider this re-apply is the intended value write: the range is already
+    // 0.5-1 (see FixUiScaleSliderArgs), so it fires the vanilla callback once with the
+    // correct value, syncing MiscSettings and the label.
+    [HarmonyPatch(typeof(uGUI_TabbedControlsPanel), "AddSliderOption", new Type[] { typeof(int), typeof(string), typeof(float), typeof(float), typeof(float), typeof(float), typeof(float), typeof(UnityAction<float>), typeof(SliderLabelMode), typeof(string), typeof(string) })]
+    static class FixSliderInitialValue
+    {
+        // Diagnostic: log every slider change with its before/after value so the
+        // panel open/close snapshots and the in-panel behavior can be reconstructed
+        // from the log. Each panel build creates fresh slider instances, so the
+        // listeners never accumulate. Keyed by tab+label: several tabs reuse the
+        // same label (8x "Sensitivity") and would cross-pollinate otherwise.
+        private static readonly Dictionary<string, float> lastSliderValue = new Dictionary<string, float>();
+        private static readonly Dictionary<string, float> lastFireTime = new Dictionary<string, float>();
+
+        public static void Postfix(int tabIndex, GameObject __result, string label, float value)
+        {
+            var slider = __result.GetComponentInChildren<uGUI_SnappingSlider>();
+            if (slider == null)
+            {
+                return;
+            }
+            string key = tabIndex + "|" + label;
+            lastSliderValue[key] = value;
+            slider.onValueChanged.AddListener((float v) =>
+            {
+                float before = lastSliderValue.TryGetValue(key, out float b) ? b : value;
+                lastSliderValue[key] = v;
+                if (Mathf.Approximately(before, v))
+                {
+                    return;
+                }
+                // An isolated jump (no other change on this slider in the last 2 s)
+                // is not a drag: log the caller so the writer can be identified.
+                float now = Time.time;
+                float last = lastFireTime.TryGetValue(key, out float pt) ? pt : -100f;
+                lastFireTime[key] = now;
+                Mod.logger.LogInfo($"Slider {label}: {before:0.###} -> {v:0.###}");
+                if (now - last > 2f && Mathf.Abs(v - before) > 0.05f)
+                {
+                    Mod.logger.LogInfo($"Slider {label} isolated change, stack:\n{new System.Diagnostics.StackTrace(2, false)}");
+                }
+            });
+            float pre = slider.value;
+            slider.unsnappedValue = value;
+            // The user reads the default notch (defaultValueRect) as THE value
+            // indicator. The vanilla vehicle tab proves the expected behavior:
+            // its builder passes the CURRENT value as defaultValue (log:
+            // SeaTruck Pilot "arg=0,07 def=0,07"), so its notch sits on the
+            // current value and the slider "works as expected" in the user's
+            // eyes. All other tabs pass fixed defaults (Gamma 1.0, UIScale
+            // 0.75, canvas 0.45), so their notch stays at the factory default.
+            // Do what the vehicle tab does: move the notch to the current
+            // value. Side effects: none — the panel has no reset button, and
+            // SnapValue's snap-to-default threshold is <0.01 in VR (below the
+            // 0.01 step). (v14's SetActive(false) on the notch is reverted:
+            // the user wants the notch back.)
+            slider.defaultValue = value;
+            // Build diagnostic: arg = persisted value passed to AddSliderOption,
+            // pre = where the vanilla body left the handle (snapped with the
+            // prefab step/defaultValue), post = after the re-apply. If post != arg
+            // the re-apply is broken; if post == arg and the user still sees the
+            // default, the handle visual or the default marker is the culprit.
+            Mod.logger.LogInfo($"Slider built {label}: arg={value:0.###} pre={pre:0.###} def={slider.defaultValue:0.###} step={slider.step:0.###} post={slider.value:0.###}");
+        }
+    }
+
+    // uGUI_SnappingSlider.SnapValue snaps any value within a small screen-size dependent
+    // threshold (about 20 px) of defaultValue back to defaultValue. In VR the option sliders
+    // are only ~100 px wide, which makes that threshold 0.1-0.15: dragging a slider anywhere
+    // near its default snapped back to the default and the change callback stored the snapped
+    // value, resetting the setting. Snap to the configured step instead (the vanilla
+    // SnapToStep logic), which keeps keyboard/gamepad stepping intact without the snap-back.
+    [HarmonyPatch(typeof(uGUI_SnappingSlider), "SnapValue")]
+    static class FixSnapValue
+    {
+        public static void Postfix(uGUI_SnappingSlider __instance, float value, ref float __result)
+        {
+            int num = Mathf.RoundToInt(value / __instance.step);
+            if ((double)(value - (float)num * __instance.step) >= 0.5 * (double)__instance.step)
+            {
+                num++;
+            }
+            __result = Mathf.Clamp((float)num * __instance.step, __instance.minValue, __instance.maxValue);
+        }
+    }
+
     // This hooks into the tab creation to create the options menu.
     [HarmonyPatch(typeof(uGUI_OptionsPanel), nameof(uGUI_OptionsPanel.AddTabs))]
     static class CreateOptionsTab
@@ -376,6 +577,15 @@ namespace SubmersedVR
         public static void Postfix(uGUI_OptionsPanel __instance)
         {
             Settings.AddMenu(__instance);
+            // After the panel build (which may have migrated the UI scale):
+            // keep the two (inert on PC) display-mode file fields equal to
+            // the value the game actually uses, so the next save converges
+            // the file (see CanonicalizeUiScale).
+            Settings.CanonicalizeUiScale();
+            OptionsPanelDiagnostics.LogSnapshot("open");
+            // Analyse the SeaTruck dock state on options open (no repair) and
+            // highlight the rescue button when a problem is detected.
+            SeaTruckWatchdog.RefreshRescueButton(__instance);
         }
     }
 
@@ -496,6 +706,32 @@ namespace SubmersedVR
         }
     }
 
+
+    // Default values for the VR HUD / loading screen / UI scale options.
+    // Kept out of Settings, whose public static fields are all persisted by
+    // the reflection-based serializer: a const/readonly field there throws
+    // FieldAccessException on Mono and aborts the whole save/load loop.
+    static class HudDefaults
+    {
+        // Calibrated in VR on 2026-10-12 against the game-natural frustum
+        // localScale (v12 base, no pin): the values the user settled on in the
+        // v12/v13 test sessions (canvas 0.45/0.45, UI scale 0.75).
+        public const float HudCanvasScaleX = 0.45f;
+        public const float HudCanvasScaleY = 0.45f;
+        // Ported from the SMB line (2026-10-18): in-vehicle HUD parity
+        // multiplier (user request: "aligne la taille à celui à pied").
+        public const float VehicleHudScale = 1.0f;
+        public const float VrUiScale = 0.75f;
+    }
+
+    // Hand reticle mode labels; kept out of Settings, whose public static
+    // fields are all persisted by the reflection-based serializer
+    static class HandReticleModes
+    {
+        public const string Legacy = "Legacy hand reticle";
+        public const string PointerEnd = "Put hand reticle on laserpointer end";
+        public const string TargetInfo = "Put target info on laserpointer end";
+    }
 
     #endregion
 }

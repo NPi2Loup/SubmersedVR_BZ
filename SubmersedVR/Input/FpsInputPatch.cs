@@ -106,6 +106,11 @@ namespace SubmersedVR
                 Mod.logger.LogInfo($"F2 Recenter pressed");
                 VRUtil.Recenter();
             }
+            if (Settings.IsDebugEnabled && Input.GetKeyDown(KeyCode.F10))
+            {
+                Mod.logger.LogInfo($"F10 ForceUnstick pressed");
+                SeatruckDebugHack.ForceUnstick();
+            }
             bool flag = false;
             bool useGazeBasedCursor = VROptions.GetUseGazeBasedCursor();
             if (GameInput.GetPrimaryDevice() == GameInput.Device.Controller || useGazeBasedCursor)
